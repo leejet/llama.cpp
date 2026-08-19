@@ -1660,91 +1660,108 @@ __global__ void quantize_rowwise_i8_cuda(const float * src, int8_t * dst, float 
     }
 }
 
+template <int N>
+__launch_bounds__(1024)
 __global__ void quantize_rowwise_i8_convrot_cuda(
-        const float * src, int8_t * dst, float * scales, int64_t k, int64_t rows, int64_t dst_stride) {
-    constexpr int group_size      = 256;
-    constexpr int group_threads   = group_size / 4;
-    constexpr int groups_per_wave = 1024 / group_threads;
-
-    const int64_t row = blockIdx.x;
-    const int tid     = threadIdx.x;
-    if (row >= rows) {
-        return;
-    }
-
-    extern __shared__ float values[];
+        const float4 * __restrict__ src, char4 * __restrict__ dst, float * __restrict__ scales, int64_t dst_stride) {
     __shared__ float maxima[32];
-    const float * src_row = src + row * k;
-    int8_t * dst_row      = dst + row * dst_stride;
 
-    for (int64_t i = tid; i < k; i += blockDim.x) {
-        values[i] = src_row[i] * (1.0f / 16.0f);
-    }
-    __syncthreads();
+    const int rid = blockIdx.x;
+    const int gid = threadIdx.y;
+    const int tid = threadIdx.x;
 
-    const int group_lane = tid % group_threads;
-    const int wave_group = tid / group_threads;
-    const int64_t groups = k / group_size;
-    for (int64_t group_base = 0; group_base < groups; group_base += groups_per_wave) {
-        const int64_t group = group_base + wave_group;
+    float x[8 * N];
+
+    { // load, stride 1
+        const float scale = 0.0625f; // 1/16
+        const int64_t off = ((int64_t) rid * blockDim.y + gid) * (64 * N);
+
 #pragma unroll
-        for (int stride = 1; stride < group_size; stride *= 4) {
-            if (group < groups) {
-                float * group_values = values + group * group_size;
-                const int base       = (group_lane / stride) * 4 * stride + group_lane % stride;
-                const int i0         = base;
-                const int i1         = i0 + stride;
-                const int i2         = i1 + stride;
-                const int i3         = i2 + stride;
-                const float a        = group_values[i0];
-                const float b        = group_values[i1];
-                const float c        = group_values[i2];
-                const float d        = group_values[i3];
-                group_values[i0]     =  a + b + c - d;
-                group_values[i1]     =  a + b - c + d;
-                group_values[i2]     =  a - b + c + d;
-                group_values[i3]     = -a + b + c + d;
-            }
-            __syncthreads();
+        for (int i = 0; i < 2 * N; ++i) {
+            float4 v = src[off + tid + 32 * i];
+
+            v.x *= scale;
+            v.y *= scale;
+            v.z *= scale;
+            v.w *= scale;
+
+            const float a = v.x + v.y;
+            const float b = v.z + v.w;
+            const float p = v.x - v.y;
+            const float q = v.z - v.w;
+
+            x[4 * i + 0] = a + q;
+            x[4 * i + 1] = a - q;
+            x[4 * i + 2] = b + p;
+            x[4 * i + 3] = b - p;
         }
     }
 
-    float local_max = 0.0f;
-    for (int64_t i = tid; i < k; i += blockDim.x) {
-        local_max = fmaxf(local_max, fabsf(values[i]));
+    // stride 4:
+#pragma unroll
+    for (int i = 0; i < 8 * N; ++i) {
+        const float xx = x[i];
+        const float xy = __shfl_xor_sync(0xffffffff, xx,      1);
+        x[i] = xx + xy + __shfl_xor_sync(0xffffffff, xx - xy, 2);
     }
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
-    }
-    const int lane = tid & 31;
-    const int warp = tid >> 5;
-    if (lane == 0) {
-        maxima[warp] = local_max;
-    }
-    __syncthreads();
 
-    if (warp == 0) {
-        local_max = lane < blockDim.x / 32 ? maxima[lane] : 0.0f;
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
-        }
-        if (lane == 0) {
-            maxima[0] = local_max / 127.0f;
-            if (scales != nullptr) {
-                scales[row] = maxima[0];
-            } else {
-                *((float *) (dst_row + k)) = maxima[0];
-            }
+    // stride 16:
+#pragma unroll
+    for (int i = 0; i < 8 * N; ++i) {
+        const float xx = x[i];
+        const float xy = __shfl_xor_sync(0xffffffff, xx,      4);
+        x[i] = xx + xy + __shfl_xor_sync(0xffffffff, xx - xy, 8);
+    }
+
+    // stride 64:
+#pragma unroll
+    for (int n = 0; n < N; ++n) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float xx = x[8 * n + i + 0];
+            const float xy = x[8 * n + i + 4];
+            const float s  = xx + xy;
+            const float d  = __shfl_xor_sync(0xffffffff, xx - xy, 16);
+            x[8 * n + i + 0] = s + d;
+            x[8 * n + i + 4] = s - d;
         }
     }
-    __syncthreads();
 
-    const float row_scale = maxima[0];
-    const float inv_scale = row_scale == 0.0f ? 0.0f : 1.0f / row_scale;
-    for (int64_t i = tid; i < k; i += blockDim.x) {
-        int value  = row_scale == 0.0f ? 0 : __float2int_rn(values[i] * inv_scale);
-        value      = max(-127, min(127, value));
-        dst_row[i] = (int8_t) value;
+    { // n group maxima
+        float amax = fabsf(x[0]);
+#pragma unroll
+        for (int i = 1; i < 8 * N; ++i) {
+            amax = fmaxf(amax, fabsf(x[i]));
+        }
+        amax = warp_reduce_max<32>(amax);
+
+        if (tid == 0) {
+            maxima[gid] = amax;
+        }
+        __syncthreads();
+    }
+
+    { // row maxima, quantize
+        float amax = (tid < blockDim.y) ? maxima[tid] : 0.0f;
+        amax = warp_reduce_max<32>(amax);
+        amax = __shfl_sync(0xffffffff, amax, 0);
+
+        const float inv_scale = (amax == 0.f) ? 0.f : 127.f / amax;
+        const int64_t off     = (int64_t) rid * dst_stride / 4 + gid * (64 * N);
+
+#pragma unroll
+        for (int i = 0; i < 2 * N; ++i) {
+            dst[off + tid + 32 * i] = make_char4(
+                __float2int_rn(x[4 * i + 0] * inv_scale),
+                __float2int_rn(x[4 * i + 1] * inv_scale),
+                __float2int_rn(x[4 * i + 2] * inv_scale),
+                __float2int_rn(x[4 * i + 3] * inv_scale)
+            );
+        }
+
+        if (tid == 0 && gid == 0) {
+            scales[rid] = amax / 127.f;
+        }
     }
 }
 
@@ -1897,29 +1914,39 @@ __global__ void dequantize_i32_rows_cuda(
 static void ggml_cuda_quantize_i8_convrot(
         ggml_backend_cuda_context & ctx, const float * src, int8_t * dst, float * scales, int64_t k, int64_t rows, int64_t rows_padded, int64_t dst_stride) {
     cudaStream_t stream = ctx.stream();
+
+    GGML_ASSERT(scales != nullptr);
+    GGML_ASSERT(((intptr_t) src) % 16 == 0);
+    GGML_ASSERT(((intptr_t) dst) %  4 == 0);
+
     if (rows_padded > rows) {
         CUDA_CHECK(cudaMemsetAsync(dst + dst_stride * rows, 0, (size_t) dst_stride * (rows_padded - rows), stream));
     }
 
-    const size_t nbytes_shared = (size_t) k * sizeof(float);
-    const size_t smpbo         = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo;
-    if (nbytes_shared + 128 <= smpbo) {
-        CUDA_SET_SHARED_MEMORY_LIMIT(quantize_rowwise_i8_convrot_cuda, smpbo - 128);
-        quantize_rowwise_i8_convrot_cuda<<<rows, 1024, nbytes_shared, stream>>>(src, dst, scales, k, rows, dst_stride);
+    const int64_t groups       = k / 256;
+    const int64_t total_groups = rows * groups;
+
+    // need to stay below 1024 threads:
+    if (groups <= 32) {
+        dim3 block(32, groups, 1);
+        quantize_rowwise_i8_convrot_cuda<1><<<rows, block, 0, stream>>>((const float4 *)src, (char4 *)dst, scales, dst_stride);
+        return;
+    }
+    if (groups <= 64 && groups % 2 == 0) {
+        dim3 block(32, groups / 2, 1);
+        quantize_rowwise_i8_convrot_cuda<2><<<rows, block, 0, stream>>>((const float4 *)src, (char4 *)dst, scales, dst_stride);
+        return;
+    }
+    if (groups <= 128 && groups % 4 == 0) {
+        dim3 block(32, groups / 4, 1);
+        quantize_rowwise_i8_convrot_cuda<4><<<rows, block, 0, stream>>>((const float4 *)src, (char4 *)dst, scales, dst_stride);
         return;
     }
 
-    const int64_t groups       = k / 256;
-    const int64_t total_groups = rows * groups;
     ggml_cuda_pool_alloc<float> partial_max(ctx.pool(), total_groups);
-    ggml_cuda_pool_alloc<float> packed_scales(ctx.pool());
-    float * scales_d = scales;
-    if (scales_d == nullptr) {
-        scales_d = packed_scales.alloc(rows);
-    }
     convrot_group_amax_i8_cuda<<<total_groups, 64, 0, stream>>>(src, partial_max.get(), k, groups, total_groups);
-    reduce_convrot_row_amax_i8_cuda<<<rows, 256, 0, stream>>>(partial_max.get(), scales_d, groups, rows);
-    convrot_group_quantize_i8_cuda<<<total_groups, 64, 0, stream>>>(src, dst, scales_d, k, groups, total_groups, dst_stride);
+    reduce_convrot_row_amax_i8_cuda<<<rows, 256, 0, stream>>>(partial_max.get(), scales, groups, rows);
+    convrot_group_quantize_i8_cuda<<<total_groups, 64, 0, stream>>>(src, dst, scales, k, groups, total_groups, dst_stride);
 }
 
 static bool ggml_cuda_op_quantize_i8_convrot(
